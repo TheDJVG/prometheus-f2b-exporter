@@ -3,7 +3,7 @@ from fail2ban.client.csocket import CSocket
 from prometheus_client.metrics_core import InfoMetricFamily, GaugeMetricFamily, CounterMetricFamily
 from prometheus_client import REGISTRY
 
-VERSION = '2020.6.1'
+VERSION = '2020.6.2'
 
 
 class Fail2BanException(Exception):
@@ -135,7 +135,12 @@ if __name__ == "__main__":
 
     # start the HTTP server.
     httpd = make_server(ip, int(port), make_wsgi_app())
-    print(f"{sys.argv[0]} version {VERSION} serving metrics on http://{ip if ip else '0'}:{port}.")
+    print("{prog} version {version} serving metrics on http://{ip}:{port}.".format(
+        prog=sys.argv[0].split('/')[-1],
+        version=VERSION,
+        ip=ip if ip else '0',
+        port=port
+    ))
 
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
 
