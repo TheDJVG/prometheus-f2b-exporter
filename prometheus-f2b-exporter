@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+from fail2ban.client.csocket import CSocket
+from prometheus_client.metrics_core import InfoMetricFamily, GaugeMetricFamily, CounterMetricFamily
+from prometheus_client import REGISTRY
+
+VERSION = '2020.6.1'
+
+
+class Fail2BanException(Exception):
+    pass
+
+
+class _BasicFail2BanCollector:
+
+    def __init__(self, socket_path=None, registry=REGISTRY):
+        if socket_path is None:
+            socket_path = '/var/run/fail2ban/fail2ban.sock'
+
+        self._fail2ban_client = CSocket(socket_path)
+
+        registry.register(self)
+
+    def _command(self, command):
+        if isinstance(command, str):
+            command = command.split()
+
+        status, output = self._fail2ban_client.send(command)
+
+        if status != 0:
+            raise Fail2BanException(output)
+
+        if isinstance(output, str):
+            return output
+
+        return self._list_set_to_dict(output)
+
+    def _list_set_to_dict(self, values):
+        output = {}
+
+        if isinstance(values, tuple):
+            key, value = values
+            output[key] = value
+
+        if isinstance(values, list):
+            if values and isinstance(values[0], tuple):
+                for key, value in values:
+                    output[key] = self._list_set_to_dict(value) if isinstance(value, (list, tuple)) else value
+            else:
+                return values
+
+        return output
+
+    def _get_jails_count(self):
+        return self._command('status')['Number of jail']
+
+    def _get_jails(self):
+        jails = {}
+        for jail in self._command('status')['Jail list'].split(', '):
+            jails[jail] = self._command(['status', jail])
+
+        return jails
+
+
+class Fail2BanVersionCollector(_BasicFail2BanCollector):
+
+    def collect(self):
+        metric = InfoMetricFamily('fail2ban', 'Information about fail2ban.')
+        try:
+            metric.add_metric(labels=[], value={'version': self._command('version')})
+        except Fail2BanException:
+            pass
+        yield metric
+
+
+class Fail2BanJailCollector(_BasicFail2BanCollector):
+
+    def collect(self):
+        metric = GaugeMetricFamily('fail2ban_total_jails', 'Total amount of fail2ban jails.')
+        try:
+            metric.add_metric([], self._get_jails_count())
+        except Fail2BanException:
+            pass
+        yield metric
+
+        try:
+            jails = self._get_jails()
+        except Fail2BanException:
+            return
+
+        current_banned_metric = GaugeMetricFamily('fail2ban_current_banned', 'Current banned IPs by jail.',
+                                                  labels=['jail'])
+        total_banned_metric = CounterMetricFamily('fail2ban_total_banned', 'Total banned IPs by jail.',
+                                                  labels=['jail'])
+
+        current_failed_metric = GaugeMetricFamily('fail2ban_current_failed',
+                                                  'Current filter failed detections by jail.',
+                                                  labels=['jail'])
+        total_failed_metric = CounterMetricFamily('fail2ban_total_failed', 'Total filter failed detections by jail.',
+                                                  labels=['jail'])
+
+        for jail, data in jails.items():
+            current_banned_metric.add_metric([jail], data['Actions']['Currently banned'])
+            total_banned_metric.add_metric([jail], data['Actions']['Total banned'])
+            current_failed_metric.add_metric([jail], data['Filter']['Currently failed'])
+            total_failed_metric.add_metric([jail], data['Filter']['Total failed'])
+
+        yield current_banned_metric
+        yield total_banned_metric
+        yield current_failed_metric
+        yield total_failed_metric
+
+
+if __name__ == "__main__":
+    import argparse
+    import signal
+    import sys
+    from prometheus_client import make_wsgi_app
+    from wsgiref.simple_server import make_server
+
+    parser = argparse.ArgumentParser(description='Export fail2ban metrics in Prometheus format.',
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('-version', action='version', version='%(prog)s ' + VERSION)
+    parser.add_argument('-web.listen-address', type=str, action='store',
+                        help='Listen on this address.', default=':9635', dest='web_listen')
+    parser.add_argument('-fail2ban.socket-path', type=str, action='store',
+                        help='Path to fail2ban socket.', default='/var/run/fail2ban/fail2ban.sock',
+                        dest="f2b_socket_path")
+
+    args = parser.parse_args()
+
+    # Start the collectors
+    Fail2BanVersionCollector(socket_path=args.f2b_socket_path)
+    Fail2BanJailCollector(socket_path=args.f2b_socket_path)
+    ip, port = args.web_listen.rsplit(':', 1)
+
+    # start the HTTP server.
+    httpd = make_server(ip, int(port), make_wsgi_app())
+    print(f"{sys.argv[0]} version {VERSION} serving metrics on http://{ip if ip else '0'}:{port}.")
+
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
