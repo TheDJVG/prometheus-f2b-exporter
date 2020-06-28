@@ -2,8 +2,11 @@
 from fail2ban.client.csocket import CSocket
 from prometheus_client.metrics_core import InfoMetricFamily, GaugeMetricFamily, CounterMetricFamily
 from prometheus_client import REGISTRY
+import logging
 
-VERSION = '2020.6.2'
+VERSION = '2020.6.3'
+
+logger = logging.getLogger('__name__')
 
 
 class Fail2BanException(Exception):
@@ -16,7 +19,7 @@ class _BasicFail2BanCollector:
         if socket_path is None:
             socket_path = '/var/run/fail2ban/fail2ban.sock'
 
-        self._fail2ban_client = CSocket(socket_path)
+        self._socket_path = socket_path
 
         registry.register(self)
 
@@ -24,7 +27,14 @@ class _BasicFail2BanCollector:
         if isinstance(command, str):
             command = command.split()
 
-        status, output = self._fail2ban_client.send(command)
+        try:
+            fail2ban_client = CSocket(self._socket_path)
+        except Exception as e:
+            logger.error("Unable to create fail2ban connection with socket %s. Error: %s", self._socket_path, e)
+            raise Fail2BanException(e)
+
+        status, output = fail2ban_client.send(command)
+        logger.debug("Command: %s, Status: %s, Output: %s", command, status, output)
 
         if status != 0:
             raise Fail2BanException(output)
@@ -61,53 +71,65 @@ class _BasicFail2BanCollector:
         return jails
 
 
+class Fail2BanStatusCollector(_BasicFail2BanCollector):
+
+    def collect(self):
+        try:
+            metric = GaugeMetricFamily('fail2ban_up', 'If fail2ban is up.')
+            self._command('ping')
+            metric.add_metric(labels=[], value=1)
+        except Fail2BanException:
+            metric.add_metric(labels=[], value=0)
+        yield metric
+
+
 class Fail2BanVersionCollector(_BasicFail2BanCollector):
 
     def collect(self):
-        metric = InfoMetricFamily('fail2ban', 'Information about fail2ban.')
         try:
+            metric = InfoMetricFamily('fail2ban', 'Information about fail2ban.')
             metric.add_metric(labels=[], value={'version': self._command('version')})
+            yield metric
         except Fail2BanException:
             pass
-        yield metric
 
 
 class Fail2BanJailCollector(_BasicFail2BanCollector):
 
     def collect(self):
-        metric = GaugeMetricFamily('fail2ban_total_jails', 'Total amount of fail2ban jails.')
         try:
+            metric = CounterMetricFamily('fail2ban_jails', 'Total amount of fail2ban jails.')
             metric.add_metric([], self._get_jails_count())
+            yield metric
         except Fail2BanException:
             pass
-        yield metric
 
         try:
             jails = self._get_jails()
+
+            current_banned_metric = GaugeMetricFamily('fail2ban_banned_current', 'Current banned IPs by jail.',
+                                                      labels=['jail'])
+            total_banned_metric = CounterMetricFamily('fail2ban_banned', 'Total banned IPs by jail.',
+                                                      labels=['jail'])
+
+            current_failed_metric = GaugeMetricFamily('fail2ban_failed_current',
+                                                      'Current filter failed detections by jail.',
+                                                      labels=['jail'])
+            total_failed_metric = CounterMetricFamily('fail2ban_failed', 'Total filter failed detections by jail.',
+                                                      labels=['jail'])
+
+            for jail, data in jails.items():
+                current_banned_metric.add_metric([jail], data['Actions']['Currently banned'])
+                total_banned_metric.add_metric([jail], data['Actions']['Total banned'])
+                current_failed_metric.add_metric([jail], data['Filter']['Currently failed'])
+                total_failed_metric.add_metric([jail], data['Filter']['Total failed'])
+
+            yield current_banned_metric
+            yield total_banned_metric
+            yield current_failed_metric
+            yield total_failed_metric
         except Fail2BanException:
             return
-
-        current_banned_metric = GaugeMetricFamily('fail2ban_current_banned', 'Current banned IPs by jail.',
-                                                  labels=['jail'])
-        total_banned_metric = CounterMetricFamily('fail2ban_total_banned', 'Total banned IPs by jail.',
-                                                  labels=['jail'])
-
-        current_failed_metric = GaugeMetricFamily('fail2ban_current_failed',
-                                                  'Current filter failed detections by jail.',
-                                                  labels=['jail'])
-        total_failed_metric = CounterMetricFamily('fail2ban_total_failed', 'Total filter failed detections by jail.',
-                                                  labels=['jail'])
-
-        for jail, data in jails.items():
-            current_banned_metric.add_metric([jail], data['Actions']['Currently banned'])
-            total_banned_metric.add_metric([jail], data['Actions']['Total banned'])
-            current_failed_metric.add_metric([jail], data['Filter']['Currently failed'])
-            total_failed_metric.add_metric([jail], data['Filter']['Total failed'])
-
-        yield current_banned_metric
-        yield total_banned_metric
-        yield current_failed_metric
-        yield total_failed_metric
 
 
 if __name__ == "__main__":
@@ -115,8 +137,16 @@ if __name__ == "__main__":
     import signal
     import sys
     from prometheus_client import make_wsgi_app
-    from wsgiref.simple_server import make_server
+    from wsgiref.simple_server import make_server, WSGIRequestHandler
 
+
+    class LoggingWSGIRequestHandler(WSGIRequestHandler):
+
+        def log_message(self, format, *args):
+            logger.info('HTTP request from %s: %s', self.client_address[0], ' '.join(args))
+
+
+    # Create arguments for the standalone version.
     parser = argparse.ArgumentParser(description='Export fail2ban metrics in Prometheus format.',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('-version', action='version', version='%(prog)s ' + VERSION)
@@ -125,16 +155,25 @@ if __name__ == "__main__":
     parser.add_argument('-fail2ban.socket-path', type=str, action='store',
                         help='Path to fail2ban socket.', default='/var/run/fail2ban/fail2ban.sock',
                         dest="f2b_socket_path")
+    parser.add_argument("-log-level", default=logging.INFO, type=lambda x: getattr(logging, x),
+                        help="Configure the logging level.")
 
     args = parser.parse_args()
 
+    # Configure logging
+    logging.basicConfig(level=args.log_level, format='%(levelname)s - %(message)s')
+
     # Start the collectors
+    Fail2BanStatusCollector(socket_path=args.f2b_socket_path)
     Fail2BanVersionCollector(socket_path=args.f2b_socket_path)
     Fail2BanJailCollector(socket_path=args.f2b_socket_path)
-    ip, port = args.web_listen.rsplit(':', 1)
 
-    # start the HTTP server.
-    httpd = make_server(ip, int(port), make_wsgi_app())
+    # Create signal to deal with shutdown. httpd.shutdown() does not seem to work.
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+
+    # Start the HTTP server.
+    ip, port = args.web_listen.rsplit(':', 1)
+    httpd = make_server(ip, int(port), make_wsgi_app(), handler_class=LoggingWSGIRequestHandler)
     print("{prog} version {version} serving metrics on http://{ip}:{port}.".format(
         prog=sys.argv[0].split('/')[-1],
         version=VERSION,
@@ -142,8 +181,7 @@ if __name__ == "__main__":
         port=port
     ))
 
-    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
-
+    # Handle keyboard interrupt gracefully.
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

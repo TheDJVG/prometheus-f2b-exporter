@@ -3,7 +3,7 @@ This is a generic Fail2ban exporter using the fail2ban server socket directly. B
 
 ## Usage
 ```bash
-usage: prometheus-f2b-exporter [-h] [-version] [-web.listen-address WEB_LISTEN] [-fail2ban.socket-path F2B_SOCKET_PATH]
+usage: prometheus-f2b-exporter [-h] [-version] [-web.listen-address WEB_LISTEN] [-fail2ban.socket-path F2B_SOCKET_PATH] [-log-level LOG_LEVEL]
 
 Export fail2ban metrics in Prometheus format.
 
@@ -14,6 +14,7 @@ optional arguments:
                         Listen on this address. (default: :9635)
   -fail2ban.socket-path F2B_SOCKET_PATH
                         Path to fail2ban socket. (default: /var/run/fail2ban/fail2ban.sock)
+  -log-level LOG_LEVEL  Configure the logging level. (default: 20)
 ```
 
 #### Recommendations

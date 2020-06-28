@@ -7,7 +7,7 @@ if not sys.version_info[0] == 3 and sys.version_info[1] < 5:
 setup(
     name="prometheus-f2b-exporter",
     python_requires=">=3.5",
-    version="2020.6.2",
+    version="2020.6.3",
     description="Fail2ban prometheus exporter.",
     scripts=["prometheus-f2b-exporter"],
 )
